@@ -1,12 +1,17 @@
+"""
+This is a modified version of file ctm.py (stable v2.2.0)
+The modifications are to incorporate an extra, "regressive" term in the training objective
+All are highlighted in the code with #####
+Authors: Amit Kumar, Nazanin Esmaili, Massimo Piccardi, November 2022
+"""
+
 import torch
-from torch import nn
+from torch import nn, Tensor
 from torch.nn import functional as F
 
 from contextualized_topic_models.networks.inference_network import CombinedInferenceNetwork, ContextualInferenceNetwork
 
-
 class DecoderNetwork(nn.Module):
-
 
     def __init__(self, input_size, bert_size, infnet, n_components=10, model_type='prodLDA',
                  hidden_sizes=(100,100), activation='softplus', dropout=0.2,
@@ -42,7 +47,6 @@ class DecoderNetwork(nn.Module):
         self.dropout = dropout
         self.learn_priors = learn_priors
         self.topic_word_matrix = None
-
 
         if infnet == "zeroshot":
             self.inf_net = ContextualInferenceNetwork(
@@ -83,6 +87,16 @@ class DecoderNetwork(nn.Module):
         self.beta = nn.Parameter(self.beta)
         nn.init.xavier_uniform_(self.beta)
 
+        #####
+        # defines the matrix that will reconstruct the x_bert embedding
+        # self.Map: input_size x bert_size
+        self.Map = torch.Tensor(input_size, bert_size)
+        if torch.cuda.is_available():
+            self.Map = self.Map.cuda()
+        self.Map = nn.Parameter(self.Map)
+        nn.init.xavier_uniform_(self.Map)
+        #####
+
         self.beta_batchnorm = nn.BatchNorm1d(input_size, affine=False)
 
         # dropout on theta
@@ -113,6 +127,13 @@ class DecoderNetwork(nn.Module):
                 self.beta_batchnorm(torch.matmul(theta, self.beta)), dim=1)
             # word_dist: batch_size x input_size
             self.topic_word_matrix = self.beta
+            
+            #####
+            # reconstructs the x_bert embedding
+            # x_bert_reconstructed: batch_size x bert_size
+            x_bert_reconstructed = torch.matmul(word_dist, self.Map)
+            #####
+        
         elif self.model_type == 'LDA':
             # simplex constrain on Beta
             beta = F.softmax(self.beta_batchnorm(self.beta), dim=1)
@@ -129,8 +150,11 @@ class DecoderNetwork(nn.Module):
         if labels is not None:
             estimated_labels = self.label_classification(theta)
 
+        #####
+        # added two extra returned values
         return self.prior_mean, self.prior_variance, \
-            posterior_mu, posterior_sigma, posterior_log_sigma, word_dist, estimated_labels
+            posterior_mu, posterior_sigma, posterior_log_sigma, word_dist, estimated_labels, x_bert, x_bert_reconstructed
+        #####
 
     def get_theta(self, x, x_bert, labels=None):
         with torch.no_grad():
@@ -141,5 +165,4 @@ class DecoderNetwork(nn.Module):
             # generate samples from theta
             theta = F.softmax(
                 self.reparameterize(posterior_mu, posterior_log_sigma), dim=1)
-
             return theta
