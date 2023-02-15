@@ -1,3 +1,10 @@
+"""
+This is a modified version of file ctm.py (stable v2.2.0)
+The modifications are to incorporate an extra, "regressive" term in the training objective
+All are highlighted in the code with #####
+Authors: Amit Kumar, Nazanin Esmaili, Massimo Piccardi, November 2022
+"""
+
 import datetime
 import multiprocessing as mp
 import os
@@ -6,6 +13,8 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+torch.manual_seed(1234)
+#import mlflow.pytorch._pytorch_autolog
 import wordcloud
 from scipy.special import softmax
 from torch import optim
@@ -15,8 +24,8 @@ from tqdm import tqdm
 from contextualized_topic_models.utils.early_stopping.early_stopping import EarlyStopping
 from contextualized_topic_models.networks.decoding_network import DecoderNetwork
 
-
 class CTM:
+
     """Class to train the contextualized topic model. This is the more general class that we are keeping to
     avoid braking code, users should use the two subclasses ZeroShotTM and CombinedTm to do topic modeling.
 
@@ -40,12 +49,16 @@ class CTM:
     :param loss_weights: dict, it contains the name of the weight parameter (key) and the weight (value) for each loss.
     It supports only the weight parameter beta for now. If None, then the weights are set to 1 (default: None).
 
-    """
+	#####
+	:param epsilon: float, coefficient to mix the new RL_bert loss, expected to be >= 0
+    #####
+
+	"""
 
     def __init__(self, bow_size, contextual_size, inference_type="combined", n_components=10, model_type='prodLDA',
                  hidden_sizes=(100, 100), activation='softplus', dropout=0.2, learn_priors=True, batch_size=64,
                  lr=2e-3, momentum=0.99, solver='adam', num_epochs=100, reduce_on_plateau=False,
-                 num_data_loader_workers=mp.cpu_count(), label_size=0, loss_weights=None):
+                 num_data_loader_workers=mp.cpu_count(), label_size=0, loss_weights=None, epsilon=0.0): ##### new keyword parameter
 
         self.device = (
                 torch.device("cuda")
@@ -95,7 +108,7 @@ class CTM:
         self.reduce_on_plateau = reduce_on_plateau
         self.num_data_loader_workers = num_data_loader_workers
         self.training_doc_topic_distributions = None
-
+        self.epsilon = epsilon
         if loss_weights:
             self.weights = loss_weights
         else:
@@ -124,6 +137,7 @@ class CTM:
 
         # training attributes
         self.model_dir = None
+        self.train_data = None
         self.nn_epoch = None
 
         # validation attributes
@@ -141,7 +155,7 @@ class CTM:
         self.model = self.model.to(self.device)
 
     def _loss(self, inputs, word_dists, prior_mean, prior_variance,
-              posterior_mean, posterior_variance, posterior_log_variance):
+              posterior_mean, posterior_variance, posterior_log_variance, x_bert, x_bert_reconstructed):
 
         # KL term
         # var division term
@@ -160,7 +174,38 @@ class CTM:
         # Reconstruction term
         RL = -torch.sum(inputs * torch.log(word_dists + 1e-10), dim=1)
 
-        #loss = self.weights["beta"]*KL + RL
+        #####
+        # # creates the extra reconstruction term on x_bert and adds it to RL (LA norm version)
+        # from torch import linalg as LA
+        # RL_bert = self.epsilon * LA.norm(x_bert - x_bert_reconstructed, dim=1)
+        # # Both RL and RL_bert are batch_size x 1 vectors
+        # RL += RL_bert
+        #####
+
+        #####
+        # # creates the extra reconstruction term on x_bert and adds it to RL (-cosine similarity version)
+        # from torch import nn
+        # cos = nn.CosineSimilarity(dim=1, eps=1e-6) # creates the operator
+        # RL_bert = self.epsilon * -cos(x_bert, x_bert_reconstructed)
+        # RL += RL_bert
+        #####
+
+        #####
+        # creates the extra reconstruction term on x_bert and adds it to RL (L1 & L2 distance versions)
+        from torch import nn
+        pdist = nn.PairwiseDistance(p=2)
+        RL_bert = self.epsilon * pdist(x_bert, x_bert_reconstructed)
+        RL += RL_bert
+        #####
+
+        #####
+        # # creates the extra reconstruction term on x_bert and adds it to RL (Minkowski distance version)
+        # from scipy.spatial import minkowski_distance
+        # RL_bert = minkowski_distance(x_bert, x_bert_reconstructed, 3)
+        # RL += RL_bert
+        #####
+
+        # loss = self.weights["beta"]*KL + RL # <-- NB: comment in original CTM code
 
         return KL, RL
 
@@ -189,13 +234,21 @@ class CTM:
 
             # forward pass
             self.model.zero_grad()
+			
+            #####
+            # adding two extra returned values:
             prior_mean, prior_variance, posterior_mean, posterior_variance,\
-            posterior_log_variance, word_dists, estimated_labels = self.model(X_bow, X_contextual, labels)
+            posterior_log_variance, word_dists, estimated_labels, x_bert, x_bert_reconstructed = self.model(X_bow, X_contextual, labels)
+            #####
 
             # backward pass
+            
+			#####
+            # passing two extra arguments to self._loss
             kl_loss, rl_loss = self._loss(
                 X_bow, word_dists, prior_mean, prior_variance,
-                posterior_mean, posterior_variance, posterior_log_variance)
+                posterior_mean, posterior_variance, posterior_log_variance, x_bert, x_bert_reconstructed)
+            #####
 
             loss = self.weights["beta"]*kl_loss + rl_loss
             loss = loss.sum()
@@ -217,7 +270,7 @@ class CTM:
 
         return samples_processed, train_loss
 
-    def fit(self, train_dataset, validation_dataset=None, save_dir=None, verbose=False, patience=5, delta=0,
+    def fit(self, train_dataset, validation_dataset=None, save_dir=None, verbose=True, patience=20, delta=0,
             n_samples=20):
         """
         Train the CTM model.
@@ -233,7 +286,7 @@ class CTM:
         """
         # Print settings to output file
         if verbose:
-            print("Settings: \n\
+            print("Settings - ctm: \n\
                    N Components: {}\n\
                    Topic Prior Mean: {}\n\
                    Topic Prior Variance: {}\n\
@@ -252,14 +305,13 @@ class CTM:
                 self.lr, self.momentum, self.reduce_on_plateau, save_dir))
 
         self.model_dir = save_dir
-        self.idx2token = train_dataset.idx2token
-        train_data = train_dataset
+        self.train_data = train_dataset
         self.validation_data = validation_dataset
         if self.validation_data is not None:
             self.early_stopping = EarlyStopping(patience=patience, verbose=verbose, path=save_dir, delta=delta)
         train_loader = DataLoader(
-            train_data, batch_size=self.batch_size, shuffle=True,
-            num_workers=self.num_data_loader_workers, drop_last=True)
+            self.train_data, batch_size=self.batch_size, shuffle=True,
+            num_workers=self.num_data_loader_workers)
 
         # init training variables
         train_loss = 0
@@ -278,7 +330,7 @@ class CTM:
 
             if self.validation_data is not None:
                 validation_loader = DataLoader(self.validation_data, batch_size=self.batch_size, shuffle=True,
-                                               num_workers=self.num_data_loader_workers, drop_last=True)
+                                               num_workers=self.num_data_loader_workers)
                 # train epoch
                 s = datetime.datetime.now()
                 val_samples_processed, val_loss = self._validation(validation_loader)
@@ -292,7 +344,7 @@ class CTM:
 
                 pbar.set_description("Epoch: [{}/{}]\t Seen Samples: [{}/{}]\tTrain Loss: {}\tValid Loss: {}\tTime: {}".format(
                     epoch + 1, self.num_epochs, samples_processed,
-                    len(train_data) * self.num_epochs, train_loss, val_loss, e - s))
+                    len(self.train_data) * self.num_epochs, train_loss, val_loss, e - s))
 
                 self.early_stopping(val_loss, self)
                 if self.early_stopping.early_stop:
@@ -306,7 +358,7 @@ class CTM:
                     self.save(save_dir)
             pbar.set_description("Epoch: [{}/{}]\t Seen Samples: [{}/{}]\tTrain Loss: {}\tTime: {}".format(
                 epoch + 1, self.num_epochs, samples_processed,
-                len(train_data) * self.num_epochs, train_loss, e - s))
+                len(self.train_data) * self.num_epochs, train_loss, e - s))
 
         pbar.close()
         self.training_doc_topic_distributions = self.get_doc_topic_distribution(train_dataset, n_samples)
@@ -336,7 +388,7 @@ class CTM:
             # forward pass
             self.model.zero_grad()
             prior_mean, prior_variance, posterior_mean, posterior_variance, posterior_log_variance, word_dists, \
-            estimated_labels =\
+            estimated_labels,  x_bert, x_bert_reconstructed =\
                 self.model(X_bow, X_contextual, labels)
 
             kl_loss, rl_loss = self._loss(X_bow, word_dists, prior_mean, prior_variance,
@@ -433,7 +485,7 @@ class CTM:
         topics = defaultdict(list)
         for i in range(self.n_components):
             _, idxs = torch.topk(component_dists[i], k)
-            component_words = [self.idx2token[idx]
+            component_words = [self.train_data.idx2token[idx]
                                for idx in idxs.cpu().numpy()]
             topics[i] = component_words
         return topics
@@ -450,7 +502,7 @@ class CTM:
         topics = []
         for i in range(self.n_components):
             _, idxs = torch.topk(component_dists[i], k)
-            component_words = [self.idx2token[idx]
+            component_words = [self.train_data.idx2token[idx]
                                for idx in idxs.cpu().numpy()]
             topics.append(component_words)
         return topics
@@ -535,7 +587,7 @@ class CTM:
             raise Exception('Topic id must be lower than the number of topics')
         else:
             wd = self.get_topic_word_distribution()
-            t = [(word, wd[topic][idx]) for idx, word in self.idx2token.items()]
+            t = [(word, wd[topic][idx]) for idx, word in self.train_data.idx2token.items()]
             t = sorted(t, key=lambda x: -x[1])
         return t
 
