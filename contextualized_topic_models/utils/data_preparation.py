@@ -7,7 +7,7 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.preprocessing import OneHotEncoder
 
 
-def get_bag_of_words(data, min_length):
+def bag_of_words(data, min_length):
     """
     Creates the bag of words
     """
@@ -133,7 +133,7 @@ class TopicModelDataPreparation:
             )
         else:
             train_contextualized_embeddings = custom_embeddings
-        self.vocab = self.vectorizer.get_feature_names_out()
+        self.vocab = self.vectorizer.get_feature_names()
         self.id2token = {k: v for k, v in zip(range(0, len(self.vocab)), self.vocab)}
 
         if labels:
