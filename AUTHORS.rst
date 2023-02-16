@@ -2,14 +2,10 @@
 Credits
 =======
 
-Development Lead
+Authors
 ----------------
 
-* Federico Bianchi <f.bianchi@unibocconi.it>
-* Silvia Terragni <s.terragni4@campus.unimib.it>
-* Dirk Hovy <dirk.hovy@unibocconi.it>
+* Amit Kumar <amit270980@gmail.com>
+* Nazanin Esmaili <nazanin.esmaili@uts.edu.au>
+* Massimo Piccardi<Massimo.Piccardi@uts.edu.au >
 
-Contributors
-------------
-
-None yet. Why not be the first?
